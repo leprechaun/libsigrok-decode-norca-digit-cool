@@ -53,21 +53,30 @@ class Decoder(srd.Decoder):
         ('fan-mode', 'Fan Mode'),
         ('power', 'Power'),
         ('mode', 'Mode'),
+        ('swing', 'Swing'),
+        ('unknown', 'Unknown'),
     )
     annotation_rows = (
         ('packet', 'Packet', (0, 1, 2)),
         ('bits', 'Bits', (3,)),
         ('data', 'Data', (5,)),
         ('debug', 'Debug', (4,)),
-        ('meaning', 'Meaning', (6, 7, 8, 9)),
+        ('meaning', 'Meaning', (6, 7, 8, 9, 10, 11)),
     )
 
     def __init__(self):
         self.reset()
 
     def reset(self):
+        #self.timings = {0:[], 1: []}
         self.samplerate = None
         self.edges, self.bits, self.ss_es_bits = [], [], []
+        self.timings = {
+            0: [],
+            1: [],
+            'hello': [],
+            'bye': []
+        }
         self.state = 'IDLE'
         self.packet_data = []
         self.packet_count = 0
@@ -84,6 +93,7 @@ class Decoder(srd.Decoder):
             self.header_length = int(float(self.samplerate) * 0.004)
             self.bye_length = int(float(self.samplerate) * 0.00018)
             self.margin_length = int(0.00018 * float(self.samplerate))
+            #self.print("SampleRate: %s" % self.samplerate)
 
     def debug_bits(self, bits):
         return [ (b[0], b[0] / self.samplerate, b[1]) for b in bits]
@@ -108,33 +118,69 @@ class Decoder(srd.Decoder):
         self.end_fan = 0
 
         self.next_edge = 'l' if self.options['polarity'] == 'active-low' else 'h'
+        self.debug("RESET THE STATE")
 
     def polarity(self, ir):
         return True if self.options['polarity'] == 'active-low' and ir == 0 else False
 
     def debug(self, message):
         if True:
-            print(message)
+            print("s#%s (p#%s, e#%s): %s" % (self.samplenum, self.packet_count, len(self.edges), message))
 
-    def approximately(self, milliseconds):
+    def approximately(self, milliseconds, margin = 0.1):
         seconds = float(milliseconds) / float(1000)
-        lower_bound = (seconds * 0.9) * self.samplerate
-        upper_bound = (seconds * 1.1) * self.samplerate
+        lower_bound = (seconds * (1 - margin)) * self.samplerate
+        upper_bound = (seconds * (1 + margin)) * self.samplerate
         return range(int(lower_bound), int(upper_bound + 1))
 
     def decode(self):
         if not self.samplerate:
             raise SamplerateError('Cannot decode without samplerate.')
+
         while True:
 
             # self.ir == 0 | 1 => state?
             # self.samplenum == index of the current edge?
             (self.ir, ) = self.wait({0: self.next_edge})
 
-            self.debug("GOT samplenum: %s - %s - %s" % (self.samplenum, self.polarity(self.ir), self.samplenum / self.samplerate))
+            self.next_edge = 'l' if self.ir else 'h'
 
             self.edges.append(self.samplenum)
-            self.bits.append([self.samplenum, self.polarity(self.ir)])
+            self.bits.append([self.samplenum, self.ir])
+
+            if len(self.edges) >= 2:
+                #self.debug("sample: #%s, @time: %s, duration: %s, state: %s, samples-since: %s" % (self.samplenum, self.samplenum / self.samplerate, (self.edges[-1] - self.edges[-2]) / self.samplerate, self.ir, (self.edges[-1] - self.edges[-2])))
+
+                self.put(
+                    self.samplenum, self.samplenum,
+                    0,
+                    [
+                        4,
+                        [
+#                            "#%s (%s later)  - %f2 (%s ms later)" % (
+                            "%s" % (
+                                ((self.samplenum - self.edges[-2]) / self.samplerate) * 1000
+                            ),
+                            "d"
+                        ]
+                    ]
+                )
+            else:
+                self.debug("sample: #%s, @time: %s, duration: X, state: %s, samples-since: X" % (self.samplenum, self.samplenum / self.samplerate, self.ir))
+#               self.put(
+#                   self.samplenum, self.samplenum,
+#                   0,
+#                   [
+#                       4,
+#                       [
+#                           "#%s (X later)  - %f2 (X ms later)" % (
+#                               self.samplenum,
+#                               self.samplenum / self.samplerate
+#                           ),
+#                           "d"
+#                       ]
+#                   ]
+#               )
 
             """
             - hello
@@ -142,130 +188,195 @@ class Decoder(srd.Decoder):
             - bye
             """
 
-            if len(self.edges) == 1:
-                if self.polarity(self.ir):
-                    self.state = 'NOT IDLE'
-                    self.debug('first is active')
-                else:
-                    self.debug("WHAT? - first edge was False")
 
+            if len(self.edges) == 1 and self.ir == 1:
+                self.debug("WHAT")
                 self.next_edge = 'l' if self.ir else 'h'
-                continue
+                self.reset_decoder_state()
 
-            #if len(self.edges) > 1 and self.next_edge == 'h':
-            if len(self.edges) > 1:
-                self.put(self.samplenum, self.samplenum, 0, [4, ["s: %s - e: %s - %%: %s - b: %s" % (self.samplenum, len(self.edges) - 2, (len(self.edges) - 2) % 2, len(self.packet_data)), "d"]])
+            # this should be HEADER
+            if len(self.bits) == 3:
+                #self.debug("Check for a HEADER")
+                #self.debug("bits: %s" % self.debug_bits(self.bits))
 
-                edge_type = self.edge_type()
-                if len(self.edges) == 2:
-                    self.debug("edge_count: %s" % len(self.edges))
-                    if edge_type == 'h':
-                        self.debug("hello as expected - %s" % self.packet_count)
-                        self.put(self.edges[-2], self.samplenum, 0, [0, ["Hello", "H"]])
-                    else:
-                        self.debug("expected hello, got %s" % edge_type)
-                        self.reset_decoder_state()
-                elif len(self.edges) >= 3:
-                    if edge_type == 'e':
-                        self.debug("ERROR")
-                        self.reset_decoder_state()
-                    elif edge_type == 'b':
-                        self.debug("bye as expected")
-                        self.put(self.edges[-2], self.samplenum, 0, [1, ["Bye", "B"]])
-                        self.put(self.edges[0], self.samplenum, 0, [2, ["Packet", "P"]])
-                        self.put(self.edges[0], self.samplenum, 0, [5, ["Data: %s" % ("".join([str(x) for x in self.packet_data])), "D"]])
-                        print('packet data')
-                        print(self.packet_data)
+                header_polarities = [ b[1] for b in self.bits ]
 
-                        temp_bits = self.packet_data[16:20]
-                        print("temp bits")
-                        print(self.packet_data)
-                        temp = int("".join([ str(b) for b in temp_bits])[::-1], 2) + 15
-                        self.put(self.start_temp, self.end_temp, 0, [6, ["Temperature: %s" % str(temp), "T: %s" % str(temp), "T"]])
+                # should match polarity
+                if header_polarities != [0,1,0]:
+                    self.debug("Header doesnt match polarity: %s vs %s" % ([0,1,0], ))
+                    self.reset_decoder_state()
+                    self.next_edge = 'l' if self.ir else 'h'
+                    continue
+                else:
+                    self.debug("Header polarities match: %s" % header_polarities)
 
-                        fan = int("".join([ str(b) for b in self.packet_data[8:10]])[::-1], 2)
-                        self.put(self.start_fan, self.end_fan, 0, [7, ["Fan: %s" % str(fan), "F: %s" % str(fan), "F"]])
 
-                        power = int("".join([ str(b) for b in self.packet_data[15:16]])[::-1], 2)
-                        self.put(self.start_power, self.end_power, 0, [8, ["Power: %s" % str(power), "P: %s" % str(power), "P"]])
+                # should match timing
+                long_low_duration = self.bits[-2][0] - self.bits[-3][0]
+                if long_low_duration not in self.approximately(4):
+                    self.debug("Header long low not in range: %s vs %s" % (long_low_duration, self.approximately(4)))
+                    self.reset_decoder_state()
+                    continue
 
-                        mode = int("".join([ str(b) for b in self.packet_data[16:17]])[::-1], 2)
-                        mode_str = "Fan" if mode == 1 else "Cool"
-                        self.put(self.start_mode, self.end_mode, 0, [9, ["Mode: %s (%s)" % (str(mode_str), mode), "M: %s (%s)" % (str(mode_str), mode), "M"]])
+                # should match timing
+                short_high_duration = self.bits[-1][0] - self.bits[-2][0]
+                if short_high_duration not in self.approximately(2):
+                    self.debug("Header short high not in range: %s vs %s" % (short_high_duration, self.approximately(4)))
+                    self.reset_decoder_state()
+                    continue
 
-                        self.debug("temp: %s" % temp)
+                self.timings['hello'].append((long_low_duration / self.samplerate, short_high_duration / self.samplerate))
 
-                        self.reset_decoder_state()
-                        self.packet_count = self.packet_count + 1
-                    # expect bits
-                    elif (len(self.edges) - 2) % 2 == 1 and len(self.edges) >= 3:
-                        self.debug("looking at bits")
-                        self.debug(self.debug_bits(self.bits))
-                        #print(self.edges)
-                        #if self.bits[-1][1] == False:
-                        #    print("last edge is False")
+                #self.debug("GOT A HEADER!")
+                self.packet_count = self.packet_count + 1
+                self.put(self.edges[-3], self.samplenum, 0, [0, ["Hello %s" % self.packet_count, "H"]])
 
-                        distance = self.samplenum - self.edges[-3]
-                        self.debug("%s, %s" % (self.edges[-1], self.edges[-2]))
-                        high_distance = (self.edges[-2] - self.edges[-3])
-                        self.debug("high distance: %s" % high_distance)
+            if len(self.bits) > 3:
+                if len(self.packet_data) == 45:
+                    if len(self.bits) % 2 == 0:
+                        if self.ir != 1:
+                            self.debug("stop bit should be high")
+                            #self.reset_decoder_state()
+                            continue
 
-                        if low_distance in self.approximately(0.48):
-                            self.put(self.edges[-3], self.samplenum, 0, [3, ["Bit: 1", "1"]])
-                            self.packet_data.append(1)
-                        elif low_distance in self.approximately(0.96):
-                            self.put(self.edges[-3], self.samplenum, 0, [3, ["Bit: 0", "0"]])
-                            self.packet_data.append(0)
+                        stop_bit_duration = self.edges[-1] - self.edges[-2]
+                        if stop_bit_duration in self.approximately(0.141, 0.5):
+                            #self.debug("stop bit lasted ~0.18ms (%s)" % str(stop_bit_duration / self.samplerate))
+                            self.put(self.edges[2], self.edges[-2], 0, [2, ["Payload: %s bits long" % len(self.packet_data), "P"]])
+                            self.put(self.edges[2], self.edges[-2], 0, [5, ["Payload: %s" % ",".join([ str(b) for b in self.packet_data]), "P"]])
+                            self.put(self.edges[-2], self.edges[-1], 0, [1, ["Bye", "B"]])
+
+                            self.debug("Expected stop bit and got one")
+                            self.timings['bye'].append((stop_bit_duration / self.samplerate, 0))
+                            #self.debug(self.timings)
+
+                            print("0: low: %s, high %s (%s)" % (
+                                float(sum([x[0] for x in self.timings[0]])) / float(len(self.timings[0])),
+                                float(sum([x[1] for x in self.timings[0]])) / float(len(self.timings[0])),
+                                len(self.timings[0])
+                            ))
+
+                            print("1: low: %s, high %s (%s)" % (
+                                float(sum([x[0] for x in self.timings[1]])) / float(len(self.timings[1])),
+                                float(sum([x[1] for x in self.timings[1]])) / float(len(self.timings[1])),
+                                len(self.timings[1])
+                            ))
+
+                            print("hello: low: %s, high %s (%s)" % (
+                                float(sum([x[0] for x in self.timings['hello']])) / float(len(self.timings['hello'])),
+                                float(sum([x[1] for x in self.timings['hello']])) / float(len(self.timings['hello'])),
+                                len(self.timings['hello'])
+                            ))
+
+                            print("bye: high: %s (%s)" % (
+                                float(sum([x[0] for x in self.timings['bye']])) / float(len(self.timings['bye'])),
+                                len(self.timings['bye'])
+                            ))
+
+                            self.reset_decoder_state()
                         else:
-                            self.debug("out of range: %s" % low_distance)
+                            self.debug("stop bit didn't last ~0.18ms (%s)" % str(stop_bit_duration / self.samplerate))
 
-                        if len(self.packet_data) == 8:
-                            self.start_fan = self.samplenum
+                    # check for stop bit
 
-                        if len(self.packet_data) == 10:
-                            self.end_fan = self.samplenum
 
-                        if len(self.packet_data) == 17:
-                            self.start_temp = self.samplenum
+                if len(self.bits) % 2 == 1:
+                    #self.debug("END OF A BIT - Process it")
+                    if self.ir != 0:
+                        #self.debug("new edges should be low (closing a high)")
+                        self.reset_decoder_state()
+                        continue
 
-                        if len(self.packet_data) == 21:
-                            self.end_temp = self.samplenum
+                    bit_low_edge_duration = self.edges[-2] - self.edges[-3]
+                    if bit_low_edge_duration not in self.approximately(0.495):
+                        self.debug("low edge of bit should always be ~0.5ms (%s) (actual: %s vs expected: %s)" % (bit_low_edge_duration / self.samplerate, bit_low_edge_duration, self.approximately(0.495)))
+                        self.reset_decoder_state()
+                        continue
 
-                        if len(self.packet_data) == 15:
-                            self.start_power = self.edges[-3]
-                            self.end_power = self.samplenum
+                    bit_high_edge_duration = self.edges[-1] - self.edges[-2]
+                    if bit_high_edge_duration not in self.approximately(0.495) and bit_high_edge_duration not in self.approximately(0.975):
+                        self.reset_decoder_state()
+                        self.debug("high edge bit is not 0.5ms or 1ms (%s) (actual: %s vs expected: %s-%s)" % (bit_high_edge_duration / self.samplerate, bit_high_edge_duration, self.approximately(0.495), self.approximately(0.975) ))
+                        continue
 
-                        if len(self.packet_data) == 16:
-                            self.start_mode = self.edges[-3]
-                            self.end_mode = self.samplenum
-
-                        self.debug(self.debug_bits(self.bits[-3:]))
+                    bit_value = None
+                    if bit_high_edge_duration in self.approximately(0.495):
+                        #self.debug("high edge bit is ~0.5ms")
+                        bit_value = 1
+                        self.timings[1].append((bit_low_edge_duration / self.samplerate, bit_high_edge_duration / self.samplerate))
+                    elif bit_high_edge_duration in self.approximately(0.974):
+                        #self.debug("high edge bit is ~1ms")
+                        self.timings[0].append((bit_low_edge_duration / self.samplerate, bit_high_edge_duration / self.samplerate))
+                        bit_value = 0
                     else:
-                        self.debug("got unexpected edge type: %s" % edge_type)
-                else:
-                    self.debug("why?")
+                        self.debug("high edge bit is not 0.5ms or 1ms (%s)" % bit_high_edge_duration )
+                        self.reset_decoder_state()
+                        continue
 
-            """
-            if self.state == 'IDLE':
-                bit = 1
-                self.edges.append(self.samplenum)
-                self.bits.append([self.samplenum, bit])
-                self.next_edge = 'l' if self.ir else 'h'
-                self.state = 'NOT IDLE'
-                continue
+                    self.packet_data.append(bit_value)
 
-            edge = self.edge_type()
-            #print(self.samplenum, self.ir, edge.upper())
-            if edge == 'e':
-                #print(len(self.edges))
-                self.reset_decoder_state() # Reset state machine upon errors.
-                continue
+                    self.put(self.edges[-3], self.edges[-1], 0, [3, ["Bit %s: %s" % (len(self.packet_data) - 1 , bit_value), "%s" % bit_value]])
 
-            self.edges.append(self.samplenum)
-            if bit is not None:
-                self.bits.append([self.samplenum, bit])
-            """
-            self.next_edge = 'l' if self.ir else 'h'
-            self.debug("")
+                    # UNKNOWNS AT THE START
+                    if len(self.packet_data) == 8:
+                        self.put(self.edges[-17], self.edges[-1], 0, [11, ["Unknown: %s" % (self.packet_data[0:8]), "U"]])
 
 
+                    # FAN - bits #8 and #9
+                    if len(self.packet_data) == 10:
+                        fan_bits = self.packet_data[8:10]
+                        fan_int = int("".join([ str(b) for b in fan_bits])[::-1], 2)
+                        fan_str = {
+                            "0":  "HIGH",
+                            "1":  "MED",
+                            "2":  "LOW",
+                            "3":  "AUTO"
+                        }
+                        self.put(self.edges[-5], self.edges[-1], 0, [7, ["Fan: %s (%s)" % (fan_str[str(fan_int)], str(fan_int)), "F: %s" % str(fan_int)]])
+
+                    # UNKNOWNS IN THE MIDDLE
+                    if len(self.packet_data) == 14:
+                        self.put(self.edges[-9], self.edges[-1], 0, [11, ["Unknown: %s" % (self.packet_data[10:14]), "U"]])
+
+
+                    # MODE - bit #14
+                    if len(self.packet_data) == 15:
+                        mode_int = self.packet_data[14]
+                        if mode_int == 1:
+                            mode_str = "COOL"
+                        elif mode_int == 0:
+                            mode_str = "FAN"
+                        else:
+                            self.debug("WHAT? INVALID MODE")
+
+                        self.put(self.edges[-3], self.edges[-1], 0, [9, ["Mode: %s (%s)" % (mode_str, mode_int), "M: %s" % mode_int]])
+
+                    # POWER - bit #15
+                    if len(self.packet_data) == 16:
+                        power_int = self.packet_data[15]
+                        if power_int == 1:
+                            power_str = "OFF"
+                        elif power_int == 0:
+                            power_str = "ON"
+                        else:
+                            self.debug("WHAT? INVALID POWER")
+
+                        self.put(self.edges[-3], self.edges[-1], 0, [8, ["Power: %s (%s)" % (power_str, power_int), "P: %s" % power_int]])
+
+
+                    # TEMP - bits #16 to #19
+                    if len(self.packet_data) == 20:
+                        temp_bits = self.packet_data[16:20]
+                        temp = int("".join([ str(b) for b in temp_bits])[::-1], 2) + 15
+                        self.put(self.edges[-9], self.edges[-1], 0, [6, ["Temperature: %s" % str(temp), "T: %s" % str(temp), "T"]])
+
+                    # SWING - bits #20 to #23
+                    if len(self.packet_data) == 24:
+                        swing_bits = self.packet_data[20:24]
+                        #self.debug("SWING BITS: %s" % swing_bits)
+                        swing_int = int("".join([ str(b) for b in swing_bits])[::-1], 2)
+                        self.put(self.edges[-9], self.edges[-1], 0, [10, ["Swing: %s" % str(swing_int), "S: %s" % str(swing_int), "S"]])
+
+                    # UNKNOWNS IN THE END
+                    if len(self.packet_data) == 45:
+                        self.put(self.edges[-43], self.edges[-1], 0, [11, ["Unknown: %s" % (self.packet_data[24:46]), "U"]])
